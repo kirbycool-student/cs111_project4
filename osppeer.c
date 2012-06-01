@@ -42,7 +42,7 @@ sem_t upload_count_mutex;
  * a bounded buffer that simplifies reading from and writing to peers.
  */
 
-#define TASKBUFSIZ	4096	// Size of task_t::buf
+#define TASKBUFSIZ	4096*2	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
 #define NTHREADS 128    //Default Number of threads
 #define MAXFILESIZ 50*1024*1024 // (50 MB) arbitrary default filesize to prevet endless dowload
