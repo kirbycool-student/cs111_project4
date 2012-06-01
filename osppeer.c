@@ -32,6 +32,8 @@ static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
 
 sem_t tracker_mutex;       //Create a mutex for syncing access to the tracker
+sem_t upload_count_mutex;
+
 
 
 /*****************************************************************************
@@ -921,7 +923,8 @@ int main(int argc, char *argv[])
         //find an empty thread slot
         for ( i = 0; i < NTHREADS*thread_multiplier; i++ )
         {
-            if ( upload_threads[i] == 0 )
+            //use kill without sending a sig, only error checking
+            if ( pthread_kill(upload_threads[i], 0) == ESRCH )
                 break;
         }
 
