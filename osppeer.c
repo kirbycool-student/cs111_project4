@@ -496,7 +496,7 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 		error("* Error while allocating task");
 		goto exit;
 	}
-	strcpy(t->filename, filename);
+	strncpy(t->filename,filename,FILENAMESIZ);
 
 	// add peers
     sem_wait(&tracker_mutex);
@@ -675,6 +675,25 @@ static void task_upload(task_t *t)
 	}
 	t->head = t->tail = 0;
 
+    char resolved_name[PATH_MAX];
+    char working_dir[PATH_MAX];
+
+    if(realpath(t->filename,resolved_name) == NULL)
+    {
+        error("Filename isn't a real path");
+        goto exit;
+    }
+    if(getcwd(working_dir,PATH_MAX) == NULL)
+    {
+        error("Couldn't get CWD");
+        goto exit;
+    }
+    if(strncmp(resolved_name,working_dir,strlen(working_dir)) != 0)
+    {
+        error("Requested file is not within CWD");
+        goto exit;
+    }
+    
 	t->disk_fd = open(t->filename, O_RDONLY);
 	if (t->disk_fd == -1) {
 		error("* Cannot open file %s", t->filename);
