@@ -744,7 +744,7 @@ void upload_cleanup( void* a )
 
 void* upload( void* a )
 {
-    task_t* t = (task_t*);
+    task_t* t = (task_t*) a;
     task_upload(t);
 
     pthread_exit(NULL);
@@ -876,7 +876,7 @@ int main(int argc, char *argv[])
 
     for ( i=0; i < num_download_threads; i++ )
     {
-        pthread_join( download_threads[i] );
+        pthread_join( download_threads[i], NULL );
     }
 
 
@@ -885,7 +885,6 @@ int main(int argc, char *argv[])
     memset( upload_threads, 0, sizeof(pthread_t)*NTHREADS );
 	while ((t = task_listen(listen_task)))
     {
-        args_t *args = malloc(sizeof(args_t));
         //find an empty thread slot
         for ( i = 0; i < NTHREADS*thread_multiplier; i++ )
         {
@@ -903,9 +902,7 @@ int main(int argc, char *argv[])
             upload_threads = tmp; 
         }
 
-        args->pthread = &upload_threads[i];
-        args->tracker_task = t;     //not actually the tracker task but im lazy
-        pthread_create( &upload_threads[i], NULL, upload, args );
+        pthread_create( &upload_threads[i], NULL, upload, (void*) (t) );
     }        
         
 
