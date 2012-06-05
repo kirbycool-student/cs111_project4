@@ -20,13 +20,18 @@
 #include <pwd.h>
 #include <time.h>
 #include <limits.h>
+#include <pthread.h>
+#include <semaphore.h>
 #include "md5.h"
 #include "osp2p.h"
+
 
 int evil_mode;			// nonzero iff this peer should behave badly
 
 static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
+
+sem_t tracker_mutex;       //Create a mutex for syncing access to the tracker
 
 
 /*****************************************************************************
@@ -37,6 +42,7 @@ static int listen_port;
 
 #define TASKBUFSIZ	4096	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
+#define NTHREADS 128    //Default Number of threads
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -73,6 +79,15 @@ typedef struct task {
 				// task_pop_peer() removes peers from it, one
 				// at a time, if a peer misbehaves.
 } task_t;
+
+typedef struct args
+{
+    task_t* tracker_task;
+    const char *filename;
+    pthread_t* pthread;
+} args_t;
+
+
 
 
 // task_new(type)
@@ -460,17 +475,22 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 	task_t *t = NULL;
 	peer_t *p;
 	size_t messagepos;
+    sem_wait(&tracker_mutex);
 	assert(tracker_task->type == TASK_TRACKER);
+    sem_post(&tracker_mutex);
 
 	message("* Finding peers for '%s'\n", filename);
 
+    sem_wait(&tracker_mutex);
 	osp2p_writef(tracker_task->peer_fd, "WANT %s\n", filename);
 	messagepos = read_tracker_response(tracker_task);
 	if (tracker_task->buf[messagepos] != '2') {
 		error("* Tracker error message while requesting '%s':\n%s",
 		      filename, &tracker_task->buf[messagepos]);
+        sem_post(&tracker_mutex);
 		goto exit;
 	}
+    sem_post(&tracker_mutex);
 
 	if (!(t = task_new(TASK_DOWNLOAD))) {
 		error("* Error while allocating task");
@@ -479,6 +499,7 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 	strcpy(t->filename, filename);
 
 	// add peers
+    sem_wait(&tracker_mutex);
 	s1 = tracker_task->buf;
 	while ((s2 = memchr(s1, '\n', (tracker_task->buf + messagepos) - s1))) {
 		if (!(p = parse_peer(s1, s2 - s1)))
@@ -489,7 +510,7 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 	}
 	if (s1 != tracker_task->buf + messagepos)
 		die("osptracker's response to WANT has unexpected format!\n");
-
+    sem_post(&tracker_mutex);
  exit:
 	return t;
 }
@@ -503,8 +524,11 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 static void task_download(task_t *t, task_t *tracker_task)
 {
 	int i, ret = -1;
+
+    sem_wait(&tracker_mutex);
 	assert((!t || t->type == TASK_DOWNLOAD)
 	       && tracker_task->type == TASK_TRACKER);
+    sem_post(&tracker_mutex);
 
 	// Quit if no peers, and skip this peer
 	if (!t || !t->peer_list) {
@@ -577,11 +601,13 @@ static void task_download(task_t *t, task_t *tracker_task)
 			t->disk_filename, (unsigned long) t->total_written);
 		// Inform the tracker that we now have the file,
 		// and can serve it to others!  (But ignore tracker errors.)
+        sem_wait(&tracker_mutex);
 		if (strcmp(t->filename, t->disk_filename) == 0) {
 			osp2p_writef(tracker_task->peer_fd, "HAVE %s\n",
 				     t->filename);
 			(void) read_tracker_response(tracker_task);
 		}
+        sem_post(&tracker_mutex);
 		task_free(t);
 		return;
 	}
@@ -679,6 +705,35 @@ static void task_upload(task_t *t)
 	task_free(t);
 }
 
+void* download( void* a)
+{
+    args_t* args = (args_t*) a;
+    task_t* t;
+    task_t* tracker_task = args->tracker_task;
+    const char *filename = args->filename;
+    if ((t = start_download(tracker_task, filename)))
+        task_download(t, tracker_task);
+    pthread_exit(NULL);
+    return NULL;
+}
+
+void upload_cleanup( void* a )
+{
+    pthread_t* pthread = (pthread_t*) a;
+    *pthread = 0;
+}
+
+void* upload( void* a )
+{
+    task_t* t = (task_t*);
+    task_upload(t);
+
+    pthread_exit(NULL);
+    return NULL;
+}
+
+
+
 
 // main(argc, argv)
 //	The main loop!
@@ -690,6 +745,17 @@ int main(int argc, char *argv[])
 	char *s;
 	const char *myalias;
 	struct passwd *pwent;
+
+    int num_download_threads;
+    int num_upload_threads;
+    int thread_multiplier;
+    pthread_t *download_threads;
+    pthread_t *upload_threads = (pthread_t*) malloc( sizeof(pthread_t) * NTHREADS );
+
+    char** arg;
+    int i;
+
+    sem_init(&tracker_mutex, 0, 1);      /* initialize mutex to 1 - binary semaphore */
 
 	// Default tracker is read.cs.ucla.edu
 	osp2p_sscanf("131.179.80.139:11111", "%I:%d",
@@ -703,8 +769,7 @@ int main(int argc, char *argv[])
 		sprintf((char *) myalias, "osppeer%d", (int) getpid());
 	}
 
-	// Ignore broken-pipe signals: if a connection dies, server should not
-	signal(SIGPIPE, SIG_IGN);
+	// Ignore broken-pipe signals: if a connection dies, server should not signal(SIGPIPE, SIG_IGN);
 
 	// Process arguments
     argprocess:
@@ -759,13 +824,71 @@ int main(int argc, char *argv[])
 	register_files(tracker_task, myalias);
 
 	// First, download files named on command line.
-	for (; argc > 1; argc--, argv++)
-		if ((t = start_download(tracker_task, argv[1])))
-			task_download(t, tracker_task);
+    num_download_threads = 0;
+    arg = argv;
+	for ( ; argc > 1; argc--, argv++)
+    {
+        num_download_threads++;
+    }
+
+    download_threads = (pthread_t*) malloc( sizeof(pthread_t) * num_download_threads );
+    for ( argv = arg, i = 0 ; i < num_download_threads; argv++, i++)
+    {
+        /*if we ran out of threads, create some more
+        if ( num_download_threads == NTHREADS*thread_multiplier;)
+        {
+            thread_multiplier *= 2;
+            pthread_t *tmp = (pthread_t*) malloc( sizeof(pthread_t) * NTHREADS * thread_multiplier); 
+            memcpy( tmp, threads, sizeof(pthread_t)*NTHREADS*thread_multiplier );
+            free(threads);
+            threads = tmp; 
+        }
+        */
+
+        args_t* args = malloc( sizeof(args_t));
+        args->tracker_task = tracker_task;
+        args->filename = argv[1];
+        if((pthread_create(&download_threads[i], NULL, download, args)))
+        {
+            fprintf(stderr, "thread creation failed\n");
+            return -1;
+        }
+    }
+
+    for ( i=0; i < num_download_threads; i++ )
+    {
+        pthread_join( download_threads[i] );
+    }
+
 
 	// Then accept connections from other peers and upload files to them!
+    num_upload_threads = 0;
+    memset( upload_threads, 0, sizeof(pthread_t)*NTHREADS );
 	while ((t = task_listen(listen_task)))
-		task_upload(t);
+    {
+        args_t *args = malloc(sizeof(args_t));
+        //find an empty thread slot
+        for ( i = 0; i < NTHREADS*thread_multiplier; i++ )
+        {
+            if ( upload_threads[i] == 0 )
+                break;
+        }
+
+        //if we ran out of threads, create some more
+        if ( num_download_threads == NTHREADS*thread_multiplier )
+        {
+            thread_multiplier *= 2;
+            pthread_t *tmp = (pthread_t*) malloc( sizeof(pthread_t) * NTHREADS * thread_multiplier); 
+            memcpy( tmp, upload_threads, sizeof(pthread_t)*NTHREADS*thread_multiplier );
+            free(upload_threads);
+            upload_threads = tmp; 
+        }
+
+        args->pthread = &upload_threads[i];
+        args->tracker_task = t;     //not actually the tracker task but im lazy
+        pthread_create( &upload_threads[i], NULL, upload, args );
+    }        
+        
 
 	return 0;
 }
